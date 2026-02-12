@@ -58,6 +58,10 @@ globals:
     type: bool
     restore_value: no
     initial_value: "false"
+  - id: critical_fault
+    type: bool
+    restore_value: no
+    initial_value: "false"
   - id: temp2_prev
     type: float
     restore_value: no
@@ -182,6 +186,15 @@ binary_sensor:
       float t = id(sensor2_failed) ? id(temp_process_backup).state : id(temp_process).state;
       return t > id(max_process_temp).state;
 
+  - platform: template
+    id: backup_sensor_fault
+    name: "Backup Sensors Fault"
+    lambda: |-
+      return (!id(temp_top).has_state()) ||
+             (!id(temp_bottom).has_state()) ||
+             isnan(id(temp_top).state) ||
+             isnan(id(temp_bottom).state);
+
 interval:
   - interval: 5s
     then:
@@ -213,6 +226,9 @@ interval:
 
           inner_setpoint = std::max(20.0f, std::min(id(max_process_temp).state - 2.0f, inner_setpoint));
 
+          const bool backup_ok = !id(backup_sensor_fault).state;
+          id(critical_fault) = id(sensor2_failed) && !backup_ok;
+
           float measured_inner = id(sensor2_failed) ? id(temp_process_backup).state : id(temp_process).state;
           const float e_inner = inner_setpoint - measured_inner;
 
@@ -232,7 +248,7 @@ interval:
           }
 
           // Reserve heater logic: activate if heating is weak (low dT/dt) and high demand.
-          if ((id(heater_pwm) > 0.70f && id(temp2_rate) < 0.02f) || id(sensor2_failed)) {
+          if (id(heater_pwm) > 0.70f && id(temp2_rate) < 0.02f) {
             id(heater_2_relay).turn_on();
           } else {
             id(heater_2_relay).turn_off();
@@ -245,12 +261,17 @@ interval:
             id(fan_relay).turn_off();
           }
 
-          // Alarm logic: sensor fault or overtemperature.
-          id(alarm_state) = id(sensor2_failed) || id(overtemp_alarm).state;
-          if (id(alarm_state)) {
-            id(buzzer_relay).turn_on();
+          // Safety logic:
+          // 1) On overtemperature: stop heaters, but no siren if condition is recoverable.
+          // 2) On critical fault (no valid process sensor at all): stop heaters + siren.
+          if (id(overtemp_alarm).state || id(critical_fault)) {
             id(heater_1_relay).turn_off();
             id(heater_2_relay).turn_off();
+          }
+
+          id(alarm_state) = id(critical_fault);
+          if (id(alarm_state)) {
+            id(buzzer_relay).turn_on();
           } else {
             id(buzzer_relay).turn_off();
           }
@@ -260,6 +281,9 @@ text_sensor:
     name: "Control Mode"
     lambda: |-
       if (id(sensor2_failed)) {
+        if (id(critical_fault)) {
+          return {"CRITICAL_SENSOR_FAULT"};
+        }
         return {"RESERVE_SENSOR_MODE"};
       }
       return {"NORMAL_MODE"};
