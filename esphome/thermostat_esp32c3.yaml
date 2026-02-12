@@ -30,6 +30,14 @@ one_wire:
     pin: GPIO4
 
 globals:
+  - id: inner_i
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: inner_prev_e
+    type: float
+    restore_value: no
+    initial_value: "0.0"
   - id: outer_i
     type: float
     restore_value: no
@@ -38,10 +46,6 @@ globals:
     type: float
     restore_value: no
     initial_value: "0.0"
-  - id: cascade_inner_setpoint
-    type: float
-    restore_value: no
-    initial_value: "45.0"
   - id: heater_pwm
     type: float
     restore_value: no
@@ -157,31 +161,12 @@ sensor:
     update_interval: 2s
 
   - platform: template
-    id: temp_process_selected
-    name: "Selected Process Temperature"
-    unit_of_measurement: "°C"
-    lambda: |-
-      if (id(sensor2_failed)) {
-        return id(temp_process_backup).state;
-      }
-      return id(temp_process).state;
-    update_interval: 2s
-
-  - platform: template
     id: temp_volume_delta
     name: "Volume Temperature Delta"
     unit_of_measurement: "°C"
     lambda: |-
       return fabsf(id(temp_top).state - id(temp_bottom).state);
     update_interval: 2s
-
-  - platform: template
-    id: cascade_inner_setpoint_sensor
-    name: "Cascade Inner Setpoint"
-    unit_of_measurement: "°C"
-    lambda: |-
-      return id(cascade_inner_setpoint);
-    update_interval: 5s
 
 binary_sensor:
   - platform: template
@@ -198,7 +183,8 @@ binary_sensor:
     id: overtemp_alarm
     name: "Overtemperature Alarm"
     lambda: |-
-      return id(temp_process_selected).state > id(max_process_temp).state;
+      float t = id(sensor2_failed) ? id(temp_process_backup).state : id(temp_process).state;
+      return t > id(max_process_temp).state;
 
   - platform: template
     id: backup_sensor_fault
@@ -209,32 +195,20 @@ binary_sensor:
              isnan(id(temp_top).state) ||
              isnan(id(temp_bottom).state);
 
-climate:
-  - platform: thermostat
-    id: process_thermostat
-    name: "Process Thermostat"
-    sensor: temp_process_selected
-    min_heating_off_time: 5s
-    min_heating_run_time: 5s
-    min_idle_time: 5s
-    heat_deadband: 0.2 °C
-    heat_overrun: 0.2 °C
-    startup_delay: false
-    heat_action:
-      - switch.turn_on: heater_1_relay
-    idle_action:
-      - switch.turn_off: heater_1_relay
-
 interval:
   - interval: 5s
     then:
       - lambda: |-
-          // Cascade outer PID: external sensor -> process thermostat setpoint.
+          // Cascade PID: outer loop by external sensor, inner loop by process sensor.
           const float dt = 5.0f;
 
           const float outer_kp = 0.80f;
           const float outer_ki = 0.015f;
           const float outer_kd = 0.08f;
+
+          const float inner_kp = 8.0f;
+          const float inner_ki = 0.20f;
+          const float inner_kd = 2.0f;
 
           const float measured_outer = id(temp_external).state;
           const float target_outer = id(target_external).state;
@@ -250,15 +224,30 @@ interval:
                                  outer_ki * id(outer_i) +
                                  outer_kd * d_outer;
 
-          id(cascade_inner_setpoint) = std::max(20.0f, std::min(id(max_process_temp).state - 2.0f, inner_setpoint));
+          inner_setpoint = std::max(20.0f, std::min(id(max_process_temp).state - 2.0f, inner_setpoint));
 
           const bool backup_ok = !id(backup_sensor_fault).state;
           id(critical_fault) = id(sensor2_failed) && !backup_ok;
 
-          // Reserve heater logic by process thermostat demand (dT/dt + positive error).
-          const float process_error = id(cascade_inner_setpoint) - id(temp_process_selected).state;
-          id(heater_pwm) = std::max(0.0f, std::min(1.0f, process_error / 15.0f));
+          float measured_inner = id(sensor2_failed) ? id(temp_process_backup).state : id(temp_process).state;
+          const float e_inner = inner_setpoint - measured_inner;
 
+          id(inner_i) += e_inner * dt;
+          id(inner_i) = std::max(-100.0f, std::min(100.0f, id(inner_i)));
+          const float d_inner = (e_inner - id(inner_prev_e)) / dt;
+          id(inner_prev_e) = e_inner;
+
+          float u = inner_kp * e_inner + inner_ki * id(inner_i) + inner_kd * d_inner;
+          id(heater_pwm) = std::max(0.0f, std::min(1.0f, u / 100.0f));
+
+          // Main heater by time-proportional control.
+          if (id(heater_pwm) > 0.25f) {
+            id(heater_1_relay).turn_on();
+          } else {
+            id(heater_1_relay).turn_off();
+          }
+
+          // Reserve heater logic: activate if heating is weak (low dT/dt) and high demand.
           if (id(heater_pwm) > 0.70f && id(temp2_rate) < 0.02f) {
             id(heater_2_relay).turn_on();
           } else {
@@ -273,22 +262,14 @@ interval:
           }
 
           // Safety logic:
-          // - Overtemperature -> disable heating until recovery (without siren).
-          // - Critical sensor fault -> disable heating + siren.
+          // 1) On overtemperature: stop heaters, but no siren if condition is recoverable.
+          // 2) On critical fault (no valid process sensor at all): stop heaters + siren.
           if (id(overtemp_alarm).state || id(critical_fault)) {
-            auto call = id(process_thermostat).make_call();
-            call.set_mode(climate::CLIMATE_MODE_OFF);
-            call.perform();
+            id(heater_1_relay).turn_off();
             id(heater_2_relay).turn_off();
-          } else {
-            auto mode_call = id(process_thermostat).make_call();
-            mode_call.set_mode(climate::CLIMATE_MODE_HEAT);
-            mode_call.set_target_temperature(id(cascade_inner_setpoint));
-            mode_call.perform();
           }
 
-          // Audible alarm on overheating, Sensor 2 fault, and critical faults.
-          id(alarm_state) = id(overtemp_alarm).state || id(sensor2_failed) || id(critical_fault);
+          id(alarm_state) = id(critical_fault);
           if (id(alarm_state)) {
             id(buzzer_relay).turn_on();
           } else {
