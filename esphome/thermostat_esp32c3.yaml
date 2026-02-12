@@ -1,0 +1,309 @@
+substitutions:
+  device_name: thermostat-c3
+  friendly_name: Thermostat C3
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: 2024.6.0
+  project:
+    name: custom.thermostat_cascade
+    version: "1.0"
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+api:
+ota:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+captive_portal:
+
+one_wire:
+  - platform: gpio
+    pin: GPIO4
+
+globals:
+  - id: outer_i
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: outer_prev_e
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: cascade_inner_setpoint
+    type: float
+    restore_value: no
+    initial_value: "45.0"
+  - id: heater_pwm
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: sensor2_failed
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: alarm_state
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: critical_fault
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: temp2_prev
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: temp2_rate
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+switch:
+  - platform: gpio
+    id: heater_1_relay
+    name: "Heater 1 Relay"
+    pin: GPIO6
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    id: heater_2_relay
+    name: "Heater 2 Relay"
+    pin: GPIO7
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    id: fan_relay
+    name: "Fan Relay"
+    pin: GPIO8
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    id: buzzer_relay
+    name: "Alarm Buzzer"
+    pin: GPIO10
+    restore_mode: ALWAYS_OFF
+
+number:
+  - platform: template
+    id: target_external
+    name: "Target External Temperature"
+    unit_of_measurement: "°C"
+    min_value: 10
+    max_value: 90
+    step: 0.5
+    restore_value: true
+    optimistic: true
+    initial_value: 45
+
+  - platform: template
+    id: max_process_temp
+    name: "Max Process Temperature"
+    unit_of_measurement: "°C"
+    min_value: 20
+    max_value: 120
+    step: 1
+    restore_value: true
+    optimistic: true
+    initial_value: 80
+
+sensor:
+  - platform: dallas_temp
+    address: 0x0000000000000001
+    name: "Sensor 1 External"
+    id: temp_external
+    update_interval: 2s
+
+  - platform: dallas_temp
+    address: 0x0000000000000002
+    name: "Sensor 2 Process"
+    id: temp_process
+    update_interval: 2s
+    on_value:
+      then:
+        - lambda: |-
+            if (id(temp2_prev) == 0.0f) {
+              id(temp2_prev) = x;
+            }
+            id(temp2_rate) = (x - id(temp2_prev)) / 2.0f;
+            id(temp2_prev) = x;
+
+  - platform: dallas_temp
+    address: 0x0000000000000003
+    name: "Sensor 3 Volume Top"
+    id: temp_top
+    update_interval: 2s
+
+  - platform: dallas_temp
+    address: 0x0000000000000004
+    name: "Sensor 4 Volume Bottom"
+    id: temp_bottom
+    update_interval: 2s
+
+  - platform: template
+    id: temp_process_backup
+    name: "Backup Process Temperature"
+    unit_of_measurement: "°C"
+    lambda: |-
+      return (id(temp_top).state + id(temp_bottom).state) * 0.5f;
+    update_interval: 2s
+
+  - platform: template
+    id: temp_process_selected
+    name: "Selected Process Temperature"
+    unit_of_measurement: "°C"
+    lambda: |-
+      if (id(sensor2_failed)) {
+        return id(temp_process_backup).state;
+      }
+      return id(temp_process).state;
+    update_interval: 2s
+
+  - platform: template
+    id: temp_volume_delta
+    name: "Volume Temperature Delta"
+    unit_of_measurement: "°C"
+    lambda: |-
+      return fabsf(id(temp_top).state - id(temp_bottom).state);
+    update_interval: 2s
+
+  - platform: template
+    id: cascade_inner_setpoint_sensor
+    name: "Cascade Inner Setpoint"
+    unit_of_measurement: "°C"
+    lambda: |-
+      return id(cascade_inner_setpoint);
+    update_interval: 5s
+
+binary_sensor:
+  - platform: template
+    id: process_sensor_fault
+    name: "Sensor 2 Fault"
+    lambda: |-
+      return (!id(temp_process).has_state()) || (isnan(id(temp_process).state));
+    on_state:
+      then:
+        - lambda: |-
+            id(sensor2_failed) = x;
+
+  - platform: template
+    id: overtemp_alarm
+    name: "Overtemperature Alarm"
+    lambda: |-
+      return id(temp_process_selected).state > id(max_process_temp).state;
+
+  - platform: template
+    id: backup_sensor_fault
+    name: "Backup Sensors Fault"
+    lambda: |-
+      return (!id(temp_top).has_state()) ||
+             (!id(temp_bottom).has_state()) ||
+             isnan(id(temp_top).state) ||
+             isnan(id(temp_bottom).state);
+
+climate:
+  - platform: thermostat
+    id: process_thermostat
+    name: "Process Thermostat"
+    sensor: temp_process_selected
+    min_heating_off_time: 5s
+    min_heating_run_time: 5s
+    min_idle_time: 5s
+    heat_deadband: 0.2 °C
+    heat_overrun: 0.2 °C
+    startup_delay: false
+    heat_action:
+      - switch.turn_on: heater_1_relay
+    idle_action:
+      - switch.turn_off: heater_1_relay
+
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          // Cascade outer PID: external sensor -> process thermostat setpoint.
+          const float dt = 5.0f;
+
+          const float outer_kp = 0.80f;
+          const float outer_ki = 0.015f;
+          const float outer_kd = 0.08f;
+
+          const float measured_outer = id(temp_external).state;
+          const float target_outer = id(target_external).state;
+          const float e_outer = target_outer - measured_outer;
+
+          id(outer_i) += e_outer * dt;
+          id(outer_i) = std::max(-40.0f, std::min(40.0f, id(outer_i)));
+          const float d_outer = (e_outer - id(outer_prev_e)) / dt;
+          id(outer_prev_e) = e_outer;
+
+          float inner_setpoint = measured_outer +
+                                 outer_kp * e_outer +
+                                 outer_ki * id(outer_i) +
+                                 outer_kd * d_outer;
+
+          id(cascade_inner_setpoint) = std::max(20.0f, std::min(id(max_process_temp).state - 2.0f, inner_setpoint));
+
+          const bool backup_ok = !id(backup_sensor_fault).state;
+          id(critical_fault) = id(sensor2_failed) && !backup_ok;
+
+          // Reserve heater logic by process thermostat demand (dT/dt + positive error).
+          const float process_error = id(cascade_inner_setpoint) - id(temp_process_selected).state;
+          id(heater_pwm) = std::max(0.0f, std::min(1.0f, process_error / 15.0f));
+
+          if (id(heater_pwm) > 0.70f && id(temp2_rate) < 0.02f) {
+            id(heater_2_relay).turn_on();
+          } else {
+            id(heater_2_relay).turn_off();
+          }
+
+          // Fan control for temperature equalization by volume gradient.
+          if (id(temp_volume_delta).state > 1.5f) {
+            id(fan_relay).turn_on();
+          } else if (id(temp_volume_delta).state < 0.7f) {
+            id(fan_relay).turn_off();
+          }
+
+          // Safety logic:
+          // - Overtemperature -> disable heating until recovery (without siren).
+          // - Critical sensor fault -> disable heating + siren.
+          if (id(overtemp_alarm).state || id(critical_fault)) {
+            auto call = id(process_thermostat).make_call();
+            call.set_mode(climate::CLIMATE_MODE_OFF);
+            call.perform();
+            id(heater_2_relay).turn_off();
+          } else {
+            auto mode_call = id(process_thermostat).make_call();
+            mode_call.set_mode(climate::CLIMATE_MODE_HEAT);
+            mode_call.set_target_temperature(id(cascade_inner_setpoint));
+            mode_call.perform();
+          }
+
+          // Audible alarm on overheating, Sensor 2 fault, and critical faults.
+          id(alarm_state) = id(overtemp_alarm).state || id(sensor2_failed) || id(critical_fault);
+          if (id(alarm_state)) {
+            id(buzzer_relay).turn_on();
+          } else {
+            id(buzzer_relay).turn_off();
+          }
+
+text_sensor:
+  - platform: template
+    name: "Control Mode"
+    lambda: |-
+      if (id(sensor2_failed)) {
+        if (id(critical_fault)) {
+          return {"CRITICAL_SENSOR_FAULT"};
+        }
+        return {"RESERVE_SENSOR_MODE"};
+      }
+      return {"NORMAL_MODE"};
+    update_interval: 5s
